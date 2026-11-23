@@ -11,6 +11,7 @@
     - [Story 2: Preempting a Ray cluster also removes its baseline workers](#story-2-preempting-a-ray-cluster-also-removes-its-baseline-workers)
     - [Story 3: Preempting an interactive Ray cluster loses the user's notebook session](#story-3-preempting-an-interactive-ray-cluster-loses-the-users-notebook-session)
     - [Story 4: Reclaiming GPU workers restarts a continuous Ray Data pipeline](#story-4-reclaiming-gpu-workers-restarts-a-continuous-ray-data-pipeline)
+    - [Story 5: A job that needs one rack evicts a whole Ray cluster placed with TAS](#story-5-a-job-that-needs-one-rack-evicts-a-whole-ray-cluster-placed-with-tas)
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
@@ -29,6 +30,7 @@
     - [Example](#example)
   - [Shrinking the PodSet](#shrinking-the-podset)
   - [Growing back](#growing-back)
+  - [Topology-Aware Scheduling](#topology-aware-scheduling)
   - [Validation](#validation)
   - [Handling](#handling)
   - [Interactions](#interactions)
@@ -126,6 +128,9 @@ until the preemptor fits. If it still does not fit, the second pass whole-evicts
 then raises shrunk victims back as far as the preemptor allows. There is no priority-band rule in
 Alpha. Classical preemption and Fair Sharing are both supported.
 
+For a Workload placed with Topology-Aware Scheduling (TAS), the shrink frees whole topology domains,
+so a preemptor with a topology request can be placed on them.
+
 ### User Stories
 
 #### Story 1: Preempting a Spark application loses all of its executors
@@ -218,6 +223,48 @@ The head remains outside partial-preemption targeting, and Kueue can remove the 
 Currently, Kueue suspends the whole RayJob in step 2.
 KubeRay deletes the Ray cluster, and when the RayJob is admitted again, the cluster is recreated and the pipeline restarts from its last persisted progress.
 
+#### Story 5: A job that needs one rack evicts a whole Ray cluster placed with TAS
+
+A team runs a RayCluster in a ClusterQueue whose ResourceFlavor uses TAS, so Kueue assigns each Pod a node.
+When a higher-priority training job needs nodes in one rack, the team wants the RayCluster to give back only those nodes.
+
+The cluster has four racks of two 8-GPU nodes, and each GPU worker uses a whole node.
+The RayCluster opts in to partial preemption, and its GPU workers can shrink to 2.
+The training job needs 2 whole nodes in one rack:
+
+```yaml
+kind: RayCluster
+metadata:
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/partial-preemption: "true"
+spec:
+  workerGroupSpecs:
+  - groupName: gpu
+    replicas: 8
+    template:
+      metadata:
+        annotations:
+          kueue.x-k8s.io/podset-partial-preemption-min-retained-count: "2"
+---
+kind: Job
+spec:
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-required-topology: cloud.provider.com/topology-rack
+```
+
+1. The RayCluster runs 8 GPU workers, one on each node.
+2. The training job arrives.
+   Kueue shrinks the GPU worker group to its minimum of 2, and fill-back raises it back to 6, which frees the two nodes of the last rack in the RayCluster's topology assignment.
+3. Kueue evicts the two workers on those nodes.
+   Once they are gone, Kueue releases their quota and their nodes, and admits the training job on that rack.
+4. When the training job finishes, the RayCluster grows back to 8 workers.
+
+Currently, Kueue evicts the whole RayCluster in step 2, because partial preemption does not shrink a PodSet with a topology assignment.
+
 ### Notes/Constraints/Caveats
 
 - The victim must opt in, and at least one of its PodSets must have a configured partial-preemption
@@ -264,9 +311,12 @@ KubeRay deletes the Ray cluster, and when the RayJob is admitted again, the clus
   including the ones the shrink spared. The next cycle can then evict a lower-priority Workload
   anyway, and repeated scale-down and regrow can cause quota oscillation. Alpha does not resolve
   this interaction; Beta will define priority-aware coordination between preemption and regrowth.
-- **Freed quota is not a freed node.** Kueue picks the Pods to evict without looking at nodes, so it
-  can free a little on several nodes. Quota then fits the preemptor, but kube-scheduler may not be
-  able to place it. Node-aware Pod selection is future work.
+- **Freed quota is not a freed node.** Without TAS, Kueue picks the Pods to evict without looking at
+  nodes, so it can free a little on several nodes. Quota then fits the preemptor, but kube-scheduler
+  may not be able to place it. Node-aware Pod selection is future work. With TAS, a SparkApplication
+  can evict executors outside the domains that the shrink frees. The domains that the release frees
+  may then not fit the preemptor, and Kueue shrinks or evicts more (see [Topology-Aware
+  Scheduling](#topology-aware-scheduling)).
 - **Downgrade.** Older versions ignore `partialPreemption` and ungate up to the admitted count,
    which is the count quota is charged at, so they don't over-use quota. An in-flight shrink stops:
    the victim's replacement Pods are ungated back up to its admitted count.
@@ -283,6 +333,8 @@ KubeRay deletes the Ray cluster, and when the RayJob is admitted again, the clus
 - **Target** — a PodSet's `partialPreemption.retainedCount`, the count Kueue shrinks it to.
 - **In-flight victim** — a preemption candidate with a pending `partialPreemption.retainedCount`,
   whose PodSet still has Pods above that target.
+- **Reduced placement** — for a PodSet with a topology assignment, the topology domains and Pod
+  counts that a shrink keeps.
 - **Request phase** — Kueue sets the target and evicts the Pods above it; quota stays charged.
 - **Release phase** — no Pod above the target is left, so Kueue releases their quota by lowering the
   PodSet's admitted count (`status.admission.podSetAssignments[].count`) to the target. The
@@ -484,8 +536,11 @@ Workload carries the opt-in annotation with value `"true"` and is elastic, and a
 has `partialPreemption.minRetainedCount` below its effective used count. In Alpha, at most one PodSet per
 Workload may be above its configured minimum and therefore be shrinkable; PodSets at or below their
 minimum do not count toward this limit. A Workload with multiple shrinkable PodSets is evicted whole
-(supporting multiple shrinkable PodSets is a Beta criterion). The shrinkable PodSet must not have a
-topology assignment. Otherwise the candidate falls back to whole eviction. The used count comes from
+(supporting multiple shrinkable PodSets is a Beta criterion). A shrinkable PodSet with a topology
+assignment is eligible only when the `ElasticJobsViaWorkloadSlicesWithTAS` gate is enabled and the
+PodSet does not request topology slices of more than one Pod (see
+[Topology-Aware Scheduling](#topology-aware-scheduling)).
+Otherwise the candidate falls back to whole eviction. The used count comes from
 the Workload's usage; an existing lower `partialPreemption.retainedCount` is used as the effective
 count for simulation. With `waitForPodsReady` enabled, a Workload that has not yet reached PodsReady
 is evicted whole rather than shrunk. In Alpha, a Workload with the
@@ -580,6 +635,10 @@ While a PodSet has a target and Pods above it, kueue-controller-manager's job re
    `False` with reason `QuotaReleased`. The `retainedCount` field stays in place and has no further
    effect once `count` equals it. The preemptor can now use the quota.
 
+For a PodSet with a topology assignment, the release also frees the domains of the removed Pods, and
+RayCluster, RayJob and RayService choose the Pods by domain (see [Topology-Aware
+Scheduling](#topology-aware-scheduling)).
+
 Because the release lowers the admitted count rather than reporting reclaimable Pods relative to the
 spec count, a later independent spec-count change cannot double-count against the reclaim and
 under-count usage.
@@ -605,6 +664,38 @@ its whole size fits.
   later used by a lower-priority Workload; repeated shrink and regrow can cause quota oscillation.
   Priority-aware coordination is deferred to Beta.
 - A later partial preemption may lower the target of the admitted Workload again.
+
+### Topology-Aware Scheduling
+
+When an eligible PodSet has a topology assignment (see [Eligibility](#eligibility)), the shrink
+frees whole topology domains, and Kueue releases them together with the quota:
+
+1. **Simulation.** The reduced placement keeps the first Pods of the PodSet's topology assignment,
+   up to the target, and frees the domains of the rest. TAS lists the domains of an assignment in
+   topology order (for example block, then rack, then node), so the freed domains are close
+   together. Kueue places the preemptor as if each shrunk victim already had its reduced placement,
+   so it never places the preemptor on a domain that a victim keeps.
+2. **Which Pods leave.** TAS places Pod indexes in assignment order, so an Indexed Job, which evicts
+   its highest indexes, empties the freed domains. RayCluster, RayJob and RayService evict first the
+   Pods outside the reduced placement, then follow the order in [Shrinking the
+   PodSet](#shrinking-the-podset). SparkApplication evicts its newest executors wherever they run
+   (see [Risks and Mitigations](#risks-and-mitigations)).
+3. **Release.** Once no Pod above the target is left, including terminating ones, Kueue rebuilds the
+   PodSet's topology assignment from the nodes that the remaining Pods run on, and lowers the
+   admitted count in the same update. A preemptor never finds the quota free while the domains still
+   look used. As for an elastic scale-down (KEP-77), the release waits while the Workload has an
+   unhealthy node.
+4. **Replacements.** While the shrink is in progress, Pods that the job's controller recreates get
+   no topology domain, so they cannot take a freed domain. They keep the `kueue.x-k8s.io/topology`
+   scheduling gate, next to the elastic-job gate, until the Workload grows back.
+5. **Growing back.** The scale-up slice keeps the running Pods in their domains and places only the
+   new Pods, as for any elastic scale-up with TAS (KEP-77). The replacements get their domains from
+   it.
+
+Eligibility requires `ElasticJobsViaWorkloadSlicesWithTAS` because the release reuses its elastic
+scale-down. That scale-down does not release part of a topology slice yet, which is why a PodSet
+that requests slices of more than one Pod (`kueue.x-k8s.io/podset-slice-size`, or a size in
+`kueue.x-k8s.io/podset-slice-required-topology-constraints`, above 1) is not eligible.
 
 ### Validation
 
@@ -643,6 +734,9 @@ The `PartialPreemption` gate depends on `ElasticJobsViaWorkloadSlices`.
 - **Gate turned off while a target is set:** Kueue stops setting partial-preemption targets and
   evicting Pods to reach them. The next preemption cycle ignores any remaining target and uses the
   regular full-eviction path for that Workload.
+- **`ElasticJobsViaWorkloadSlicesWithTAS` turned off while a PodSet with a topology assignment has a
+  target:** Kueue releases the quota of the removed Pods but not their domains. A preemptor that
+  needs those domains can evict the Workload whole.
 - **Downgrade:** see [Risks and Mitigations](#risks-and-mitigations).
 
 ### Interactions
@@ -656,12 +750,12 @@ The `PartialPreemption` gate depends on `ElasticJobsViaWorkloadSlices`.
 | `WaitForPodsReady` | Partial preemption does not shrink a Workload before it first becomes ready. For count-based readiness, the expected PodSet count is `min(spec.count, admitted.count, partialPreemption.retainedCount)`, omitting the target when unset, so shrinking does not trigger a recovery timeout solely because fewer Pods are retained. See [Integrations](#integrations). |
 | `PrioritizePreemptorWorkloads` | Recommended, so the waiting preemptor is considered before the victim's scale-up slice. |
 | `ConfigurablePreemptions` | In Alpha, victims selected by a `PreemptionConfig` rule are evicted whole. Shrinking them is a Beta criterion. |
-| `RecomputeAssignmentUponPreemptionTargetsOverlap` | May be enabled together with `PartialPreemption` in Alpha, but overlap recomputation may use lower quota usage than the victims will actually retain after partial preemption. Full support for their interaction is deferred to Beta (see [Overlap recomputation](FUTURE_WORK.md#overlap-recomputation)). |
+| `RecomputeAssignmentUponPreemptionTargetsOverlap` | May be enabled together with `PartialPreemption` in Alpha, but overlap recomputation may use lower quota usage than the victims will actually retain after partial preemption, and treat the topology domains they keep as free. Full support for their interaction is deferred to Beta (see [Overlap recomputation](FUTURE_WORK.md#overlap-recomputation)). |
 | Fair Sharing | Supported in Alpha. |
 | `AdmissionFairSharing` | No change: partial preemption keeps the existing candidate order, including the LocalQueue-usage key. |
 | `PriorityBoost` | No change: candidate ordering uses the effective priority. |
 | Preemption limits (KEP-16925, proposed) | A shrink counts as one preemption of the victim. |
-| Topology-Aware Scheduling | In Alpha, a PodSet with a topology assignment is not eligible, so partial preemption never applies to such a PodSet. |
+| Topology-Aware Scheduling | With `ElasticJobsViaWorkloadSlicesWithTAS`, a shrink frees whole topology domains; without it, a PodSet with a topology assignment is evicted whole. See [Topology-Aware Scheduling](#topology-aware-scheduling). |
 | MultiKueue | Not supported in Alpha: a worker cluster evicts a Workload with the `kueue.x-k8s.io/multikueue-origin` label whole (see [Eligibility](#eligibility)). Supporting it, including how the manager learns about a release on the worker, is a Beta criterion. |
 | `ElasticJobsViaWorkloadSlicesForProvisioningRequests` | No change for the shrink. The scale-up slice requests only the increment, as for any scale-up. |
 
@@ -737,6 +831,10 @@ make this code solid enough prior to committing the changes necessary to impleme
   skipped.
 - The ungater cap at the target, and the release condition.
 - Webhook validation of the new fields and annotations, with the gate on and off.
+- With TAS: eligibility with `ElasticJobsViaWorkloadSlicesWithTAS` on and off and with topology
+  slices; the reduced placement; the preemptor placed next to a shrunk victim; which Ray Pods are
+  evicted; the quota and the domains released in one update; and no domain given to a replacement
+  while the shrink is in progress.
 
 #### Integration tests
 
@@ -753,6 +851,8 @@ make this code solid enough prior to committing the changes necessary to impleme
   lower-priority Workload that the shrink spared.
 - The gate is turned off with a target set.
 - WaitForPodsReady does not evict a shrunk Workload.
+- With TAS, a preemptor that requires one rack is admitted on the domains that a shrunk victim
+  frees, and the victim's topology assignment drops them when its quota is released.
 
 #### e2e tests
 
@@ -760,6 +860,8 @@ make this code solid enough prior to committing the changes necessary to impleme
   the same head Pod. The evicted worker's SIGTERM drain runs.
 - SparkApplication with dynamic allocation and decommissioning: shrink and grow back without
   restarting the driver.
+- In the TAS suite, an Indexed Job and a RayCluster: shrink to free one rack for a preemptor, release,
+  and grow back.
 
 ### Graduation Criteria
 
@@ -771,13 +873,16 @@ make this code solid enough prior to committing the changes necessary to impleme
   is not enough. Fill-back raises shrunk victims to the largest count that still lets the
   preemptor fit.
 - Classical preemption and Fair Sharing are both supported.
+- PodSets with a topology assignment, with `ElasticJobsViaWorkloadSlicesWithTAS`.
 - The tests in the Test Plan.
 - Docs on opting in, setting the partial-preemption minimum, and the recommended Ray and Spark settings.
 
 #### Beta
 
 - The gate is enabled by default, and all reported bugs are fixed.
-- Support PodSets with a topology assignment, and MultiKueue.
+- Support MultiKueue.
+- Shrink PodSets that request topology slices of more than one Pod.
+- SparkApplication evicts first the executors outside the reduced placement.
 - Shrink victims selected by `PreemptionConfig` rules.
 - Cover JobSet and the other elastic integrations.
 - Support multiple shrinkable PodSets per Workload (see [Multiple PodSets per Workload](FUTURE_WORK.md#multiple-podsets-per-workload)).
@@ -809,6 +914,7 @@ make this code solid enough prior to committing the changes necessary to impleme
   `retainedCount`); `retainedCount` is no longer cleared after release — completion is detected
   by `count <= retainedCount`.
 - 2026-11-16: Fair Sharing support moved from Beta to Alpha.
+- 2026-11-23: support for PodSets with a topology assignment moved from Beta to Alpha.
 
 ## Drawbacks
 
