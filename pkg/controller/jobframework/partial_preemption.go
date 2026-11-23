@@ -29,6 +29,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +41,7 @@ import (
 	cmputil "sigs.k8s.io/kueue/pkg/util/cmp"
 	"sigs.k8s.io/kueue/pkg/util/parallelize"
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
@@ -155,8 +157,8 @@ func ParsePartialPreemptionMinRetainedCount(annotations map[string]string) (*int
 }
 
 // PodsAboveTargets returns the Pods to evict so that each PodSet keeps at most its target of
-// ungated, non-terminating Pods. Unscheduled Pods go first, then the lowest pod-deletion-cost,
-// then the newest.
+// ungated, non-terminating Pods. Pods outside the topology domains that the PodSet keeps go
+// first, then unscheduled Pods, then the lowest pod-deletion-cost, then the newest.
 func PodsAboveTargets(ctx context.Context, c client.Client, wl *kueue.Workload, targets map[kueue.PodSetReference]int32) ([]*corev1.Pod, error) {
 	pods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
 	if err != nil {
@@ -173,6 +175,10 @@ func PodsAboveTargets(ctx context.Context, c client.Client, wl *kueue.Workload, 
 		candidates = append(candidates, p)
 	}
 	slices.SortFunc(candidates, compareForEviction)
+	outside := podsOutsideKeptDomains(wl, candidates, targets)
+	slices.SortStableFunc(candidates, func(a, b *corev1.Pod) int {
+		return cmputil.CompareBool(!outside.Has(a), !outside.Has(b))
+	})
 	var toEvict []*corev1.Pod
 	for _, p := range candidates {
 		ps := kueue.PodSetReference(p.Labels[constants.PodSetLabel])
@@ -182,6 +188,39 @@ func PodsAboveTargets(ctx context.Context, c client.Client, wl *kueue.Workload, 
 		}
 	}
 	return toEvict, nil
+}
+
+// podsOutsideKeptDomains returns the Pods of the PodSets with a topology assignment that their
+// shrink cannot keep. The scheduler simulated a shrink that keeps the domains of the first target
+// Pods of the assignment (see TruncateAssignment), and may have placed the preemptor on the
+// others. sorted lists the Pods in eviction order, so the last ones are kept first.
+func podsOutsideKeptDomains(wl *kueue.Workload, sorted []*corev1.Pod, targets map[kueue.PodSetReference]int32) sets.Set[*corev1.Pod] {
+	outside := sets.New[*corev1.Pod]()
+	if wl.Status.Admission == nil {
+		return outside
+	}
+	for _, psa := range wl.Status.Admission.PodSetAssignments {
+		target, ok := targets[psa.Name]
+		if !ok || psa.TopologyAssignment == nil {
+			continue
+		}
+		kept := make(map[utiltas.TopologyDomainID]int32)
+		for _, domain := range utiltas.TruncateAssignment(utiltas.InternalFrom(psa.TopologyAssignment), target).Domains {
+			kept[utiltas.DomainID(domain.Values)] = domain.Count
+		}
+		for _, p := range slices.Backward(sorted) {
+			if kueue.PodSetReference(p.Labels[constants.PodSetLabel]) != psa.Name {
+				continue
+			}
+			domain := utiltas.DomainID(utiltas.LevelValues(psa.TopologyAssignment.Levels, p.Spec.NodeSelector))
+			if kept[domain] > 0 {
+				kept[domain]--
+			} else {
+				outside.Insert(p)
+			}
+		}
+	}
+	return outside
 }
 
 // compareForEviction orders Pods so that the ones to evict first come first.

@@ -49,7 +49,6 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/core"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
-	"sigs.k8s.io/kueue/pkg/resources"
 	utilclient "sigs.k8s.io/kueue/pkg/util/client"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
 	utilmaps "sigs.k8s.io/kueue/pkg/util/maps"
@@ -363,7 +362,10 @@ func (r *elasticJobUngater) releaseReclaimedQuota(ctx context.Context, wl *kueue
 		updated := false
 		for i := range wl.Status.Admission.PodSetAssignments {
 			psa := &wl.Status.Admission.PodSetAssignments[i]
-			if psa.PartialPreemption == nil || psa.PartialPreemption.RetainedCount == nil {
+			// The topology ungater releases a PodSet with a topology assignment together with
+			// the domains of the Pods that left.
+			if psa.PartialPreemption == nil || psa.PartialPreemption.RetainedCount == nil ||
+				psa.TopologyAssignment != nil && features.Enabled(features.ElasticJobsViaWorkloadSlicesWithTAS) {
 				continue
 			}
 			target := *psa.PartialPreemption.RetainedCount
@@ -374,12 +376,7 @@ func (r *elasticJobUngater) releaseReclaimedQuota(ctx context.Context, wl *kueue
 			if newCount >= admitCount {
 				continue
 			}
-			// Scale resourceUsage in proportion to the count so count and usage stay consistent.
-			req := resources.NewRequestsFromResourceList(psa.ResourceUsage)
-			req.Divide(int64(admitCount))
-			req.Mul(int64(newCount))
-			psa.ResourceUsage = req.ToResourceList(resources.NewResourceFormatter())
-			psa.Count = new(newCount)
+			workload.ReleasePodSetQuota(psa, newCount)
 			updated = true
 		}
 		return updated, nil

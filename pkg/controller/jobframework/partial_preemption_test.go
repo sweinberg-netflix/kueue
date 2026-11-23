@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
@@ -42,6 +43,7 @@ func TestPodsAboveTargets(t *testing.T) {
 		StatusConditions(corev1.PodCondition{Type: corev1.PodScheduled, Status: corev1.ConditionTrue})
 
 	cases := map[string]struct {
+		wl      *kueue.Workload
 		pods    []*corev1.Pod
 		targets map[kueue.PodSetReference]int32
 		want    []string
@@ -77,6 +79,26 @@ func TestPodsAboveTargets(t *testing.T) {
 			targets: map[kueue.PodSetReference]int32{"cpu": 1, "gpu": 1},
 			want:    []string{"gpu-new", "cpu-new", "gpu-mid"},
 		},
+		"evicts first the Pods outside the topology domains that the PodSet keeps": {
+			wl: utiltestingapi.MakeWorkload("wl", "ns").
+				Admission(utiltestingapi.MakeAdmission("cq").PodSets(
+					utiltestingapi.MakePodSetAssignment("workers").Count(3).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+							Domain(utiltas.TopologyDomainAssignment{Values: []string{"node-a"}, Count: 1}).
+							Domain(utiltas.TopologyDomainAssignment{Values: []string{"node-b"}, Count: 1}).
+							Domain(utiltas.TopologyDomainAssignment{Values: []string{"node-c"}, Count: 1}).
+							Obj()).
+						Obj(),
+				).Obj()).
+				Obj(),
+			pods: []*corev1.Pod{
+				worker.Clone().Name("new-on-a").CreationTimestamp(now.Add(-time.Hour)).NodeSelector(corev1.LabelHostname, "node-a").Obj(),
+				worker.Clone().Name("on-b").CreationTimestamp(now.Add(-2*time.Hour)).NodeSelector(corev1.LabelHostname, "node-b").Obj(),
+				worker.Clone().Name("old-on-c").CreationTimestamp(now.Add(-3*time.Hour)).NodeSelector(corev1.LabelHostname, "node-c").Obj(),
+			},
+			targets: map[kueue.PodSetReference]int32{"workers": 2},
+			want:    []string{"old-on-c"},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -90,7 +112,11 @@ func TestPodsAboveTargets(t *testing.T) {
 				WithLists(&corev1.PodList{Items: objs}).
 				Build()
 
-			got, err := jobframework.PodsAboveTargets(ctx, cl, wl, tc.targets)
+			workload := wl
+			if tc.wl != nil {
+				workload = tc.wl
+			}
+			got, err := jobframework.PodsAboveTargets(ctx, cl, workload, tc.targets)
 			if err != nil {
 				t.Fatalf("PodsAboveTargets() error: %v", err)
 			}
