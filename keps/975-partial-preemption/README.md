@@ -634,7 +634,7 @@ frees whole topology domains, and Kueue releases them together with the quota:
    so it never places the preemptor on a domain that a victim keeps.
 2. **Which Pods leave.** TAS places Pod indexes in assignment order, so an Indexed Job, which evicts
    its highest indexes, empties the freed domains. RayCluster, RayJob and RayService evict first the
-   Pods outside the reduced placement, then follow the order in [Shrinking the
+   Pods on the domains that the shrink frees, then follow the order in [Shrinking the
    PodSet](#shrinking-the-podset). SparkApplication evicts its newest executors wherever they run
    (see [Risks and Mitigations](#risks-and-mitigations)).
 3. **Release.** Once no Pod above the target is left, including terminating ones, Kueue rebuilds the
@@ -839,7 +839,7 @@ make this code solid enough prior to committing the changes necessary to impleme
 - The gate is enabled by default, and all reported bugs are fixed.
 - Support MultiKueue.
 - Shrink PodSets that request topology slices of more than one Pod.
-- SparkApplication evicts first the executors outside the reduced placement.
+- SparkApplication evicts first the executors on the domains that the shrink frees.
 - Shrink victims selected by `PreemptionConfig` rules.
 - Cover JobSet and the other elastic integrations.
 - Support multiple shrinkable PodSets per Workload (see [Multiple PodSets per Workload](FUTURE_WORK.md#multiple-podsets-per-workload)).
