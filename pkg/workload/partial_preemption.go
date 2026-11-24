@@ -17,6 +17,7 @@ limitations under the License.
 package workload
 
 import (
+	"slices"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -26,7 +27,9 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/util/api"
+	"sigs.k8s.io/kueue/pkg/util/tas"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 )
 
@@ -56,13 +59,32 @@ func PartialPreemptionPodSet(wl *kueue.Workload, requests []PodSetResources) (ku
 			if psr.Name != ps.Name || psr.Count <= *ps.PartialPreemption.MinRetainedCount {
 				continue
 			}
-			if psr.TopologyRequest != nil || shrinkablePodSet != "" {
+			if psr.TopologyRequest != nil && !canShrinkTopology(ps) || shrinkablePodSet != "" {
 				return "", false
 			}
 			shrinkablePodSet = ps.Name
 		}
 	}
 	return shrinkablePodSet, shrinkablePodSet != ""
+}
+
+// canShrinkTopology reports whether partial preemption can shrink a PodSet with a topology
+// assignment. The topology ungater releases the domains of the Pods that leave, as it does for
+// an elastic scale-down, but not for Pods placed in slices.
+func canShrinkTopology(ps *kueue.PodSet) bool {
+	return features.Enabled(features.ElasticJobsViaWorkloadSlicesWithTAS) &&
+		!slices.ContainsFunc(tas.PodSetSliceRequiredTopologyConstraints(ps.TopologyRequest),
+			func(c kueue.PodsetSliceRequiredTopologyConstraint) bool { return c.Size > 1 })
+}
+
+// ReleasePodSetQuota lowers the admitted count of psa to count and scales its resource usage
+// with it.
+func ReleasePodSetQuota(psa *kueue.PodSetAssignment, count int32) {
+	req := resources.NewRequestsFromResourceList(psa.ResourceUsage)
+	req.Divide(int64(ptr.Deref(psa.Count, count)))
+	req.Mul(int64(count))
+	psa.ResourceUsage = req.ToResourceList(resources.NewResourceFormatter())
+	psa.Count = new(count)
 }
 
 // HasPendingPreemptionRetainedCount reports whether any admitted PodSet still has an in-flight

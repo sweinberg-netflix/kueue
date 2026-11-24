@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -268,6 +269,11 @@ func (r *topologyUngater) podsToUngateForPodSet(
 			rankOffset = offset
 		}
 	}
+	if features.Enabled(features.PartialPreemption) && workload.HasPendingPreemptionRetainedCount(wl) {
+		// Pods recreated above a partial-preemption target stay held by the elastic job gate.
+		// Leave them without a domain until the domains of the Pods that leave are released.
+		pods = slices.DeleteFunc(pods, func(p *corev1.Pod) bool { return utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) })
+	}
 	gatedPodsToDomains := assignGatedPodsToDomains(log, psa, pods, psReq, rankOffset, lendFreeCapacity)
 	gatedPodsToDomains = withoutPodsOnUnhealthyNodes(log, wl, psa, gatedPodsToDomains)
 	if len(gatedPodsToDomains) == 0 {
@@ -384,6 +390,10 @@ func (r *topologyUngater) reconcileElasticShrink(ctx context.Context, wl *kueue.
 			continue
 		}
 		count := counts[psa.Name]
+		target, partiallyPreempted := workload.PreemptionRetainedCount(wl, psa.Name)
+		if partiallyPreempted {
+			count = min(count, target)
+		}
 		// Retain nonempty grouped reservations until elastic placement can preserve partial slices.
 		if count > 0 && slices.ContainsFunc(utiltas.PodSetSliceRequiredTopologyConstraints(psNameToTopologyRequest[psa.Name]),
 			func(constraint kueue.PodsetSliceRequiredTopologyConstraint) bool { return constraint.Size > 1 }) {
@@ -398,7 +408,11 @@ func (r *topologyUngater) reconcileElasticShrink(ctx context.Context, wl *kueue.
 		if err != nil {
 			return false, err
 		}
-		pods = slices.DeleteFunc(pods, utilpod.IsTerminated)
+		// Pods held by the elastic job gate have no node, like the ones recreated above a
+		// partial-preemption target.
+		pods = slices.DeleteFunc(pods, func(p *corev1.Pod) bool {
+			return utilpod.IsTerminated(p) || utilpod.HasGate(p, kueue.ElasticJobSchedulingGate)
+		})
 		// Include terminating Pods until they disappear or become terminal.
 		// Fewer Pods may be a transient observation before replacements arrive.
 		if len(pods) != int(count) {
@@ -440,6 +454,11 @@ func (r *topologyUngater) reconcileElasticShrink(ctx context.Context, wl *kueue.
 			psa.TopologyAssignment = nil
 		} else {
 			psa.TopologyAssignment = utiltas.V1Beta2From(assignment)
+		}
+		// Release the quota of the Pods that left with their domains, so a preemptor never
+		// finds the quota free while the domains are still held.
+		if partiallyPreempted && ptr.Deref(psa.Count, count) > count {
+			workload.ReleasePodSetQuota(psa, count)
 		}
 		changed = true
 	}

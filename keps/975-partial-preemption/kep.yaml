@@ -29,6 +29,7 @@ see-also:
   - "/keps/78-dynamically-reclaiming-resources"
   - "/keps/83-workload-preemption"
   - "/keps/13396-configurable-preemptions"
+  - "/keps/2724-topology-aware-scheduling"
 
 # The target maturity stage in the current dev cycle for this KEP.
 stage: alpha

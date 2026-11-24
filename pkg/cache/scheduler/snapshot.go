@@ -587,8 +587,20 @@ func (s *Snapshot) SimulateRemovals(ctx context.Context, log logr.Logger, worklo
 	for _, w := range workloads {
 		replacements = append(replacements, WorkloadReplacement{Full: w})
 	}
+	return s.SimulateReplacements(ctx, log, replacements)
+}
+
+// SimulateReplacements is SimulateRemovals for preemption targets: a workload that partial
+// preemption shrinks keeps its Reduced usage and its Pods in the scheduling simulator.
+func (s *Snapshot) SimulateReplacements(ctx context.Context, log logr.Logger, replacements []WorkloadReplacement) func() {
+	evicted := make([]*workload.Info, 0, len(replacements))
+	for _, replacement := range replacements {
+		if replacement.Reduced == nil {
+			evicted = append(evicted, replacement.Full)
+		}
+	}
 	revertUsage := s.SimulateWorkloadRemoval(replacements)
-	revertPods := s.SimulatePodRemoval(ctx, log, workloads)
+	revertPods := s.SimulatePodRemoval(ctx, log, evicted)
 	return func() {
 		revertPods()
 		revertUsage()

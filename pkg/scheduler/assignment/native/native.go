@@ -150,11 +150,9 @@ func (p *nativePlanner) updateAssignmentForTAS(
 		log = log.WithValues("workload", klog.KRef(p.wl.Obj.Namespace, p.wl.Obj.Name))
 
 		if len(targets) > 0 {
-			var targetWorkloads []*workload.Info
-			for _, target := range targets {
-				targetWorkloads = append(targetWorkloads, target.WorkloadInfo)
-			}
-			revertRemoval := p.snapshot.SimulateRemovals(ctx, log, targetWorkloads)
+			// Place the workload where the targets leave room: a target that partial
+			// preemption shrinks keeps some of its domains.
+			revertRemoval := p.snapshot.SimulateReplacements(ctx, log, preemption.WorkloadReplacements(targets))
 			tasResult = asgn.FindTopologyAssignments(
 				ctx,
 				cq,

@@ -272,19 +272,35 @@ func (t *TopologyDomainRequests) TotalRequests() resources.Requests {
 	return t.SinglePodRequests.ScaledUp(int64(t.Count))
 }
 
-func (p *PodSetResources) ScaledTo(newCount int32) *PodSetResources {
-	if p.TopologyRequest != nil {
-		return p
+// keepFirst returns the domain requests of the first count Pods, the ones that
+// TruncateAssignment keeps, or nil if t is nil.
+func (t *TopologyRequest) keepFirst(count int32) *TopologyRequest {
+	if t == nil {
+		return nil
 	}
+	kept := &TopologyRequest{Levels: t.Levels}
+	for _, dr := range t.DomainRequests {
+		if count <= 0 {
+			break
+		}
+		dr.Count = min(dr.Count, count)
+		count -= dr.Count
+		kept.DomainRequests = append(kept.DomainRequests, dr)
+	}
+	return kept
+}
+
+func (p *PodSetResources) ScaledTo(newCount int32) *PodSetResources {
 	var req resources.Requests
 	if p.Requests != nil {
 		req = p.Requests.Clone()
 	}
 	ret := &PodSetResources{
-		Name:     p.Name,
-		Requests: req,
-		Count:    p.Count,
-		Flavors:  maps.Clone(p.Flavors),
+		Name:            p.Name,
+		Requests:        req,
+		Count:           p.Count,
+		Flavors:         maps.Clone(p.Flavors),
+		TopologyRequest: p.TopologyRequest.keepFirst(newCount),
 	}
 	if p.PerPodRequests != nil {
 		ret.PerPodRequests = p.PerPodRequests.Clone()
