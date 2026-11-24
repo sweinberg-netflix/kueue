@@ -11,7 +11,6 @@
     - [Story 2: Preempting a Ray cluster also removes its baseline workers](#story-2-preempting-a-ray-cluster-also-removes-its-baseline-workers)
     - [Story 3: Preempting an interactive Ray cluster loses the user's notebook session](#story-3-preempting-an-interactive-ray-cluster-loses-the-users-notebook-session)
     - [Story 4: Reclaiming GPU workers restarts a continuous Ray Data pipeline](#story-4-reclaiming-gpu-workers-restarts-a-continuous-ray-data-pipeline)
-    - [Story 5: A job that needs one rack evicts a whole Ray cluster placed with TAS](#story-5-a-job-that-needs-one-rack-evicts-a-whole-ray-cluster-placed-with-tas)
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
@@ -222,48 +221,6 @@ The head remains outside partial-preemption targeting, and Kueue can remove the 
 
 Currently, Kueue suspends the whole RayJob in step 2.
 KubeRay deletes the Ray cluster, and when the RayJob is admitted again, the cluster is recreated and the pipeline restarts from its last persisted progress.
-
-#### Story 5: A job that needs one rack evicts a whole Ray cluster placed with TAS
-
-A team runs a RayCluster in a ClusterQueue whose ResourceFlavor uses TAS, so Kueue assigns each Pod a node.
-When a higher-priority training job needs nodes in one rack, the team wants the RayCluster to give back only those nodes.
-
-The cluster has four racks of two 8-GPU nodes, and each GPU worker uses a whole node.
-The RayCluster opts in to partial preemption, and its GPU workers can shrink to 2.
-The training job needs 2 whole nodes in one rack:
-
-```yaml
-kind: RayCluster
-metadata:
-  annotations:
-    kueue.x-k8s.io/elastic-job: "true"
-    kueue.x-k8s.io/partial-preemption: "true"
-spec:
-  workerGroupSpecs:
-  - groupName: gpu
-    replicas: 8
-    template:
-      metadata:
-        annotations:
-          kueue.x-k8s.io/podset-partial-preemption-min-retained-count: "2"
----
-kind: Job
-spec:
-  parallelism: 2
-  template:
-    metadata:
-      annotations:
-        kueue.x-k8s.io/podset-required-topology: cloud.provider.com/topology-rack
-```
-
-1. The RayCluster runs 8 GPU workers, one on each node.
-2. The training job arrives.
-   Kueue shrinks the GPU worker group to its minimum of 2, and fill-back raises it back to 6, which frees the two nodes of the last rack in the RayCluster's topology assignment.
-3. Kueue evicts the two workers on those nodes.
-   Once they are gone, Kueue releases their quota and their nodes, and admits the training job on that rack.
-4. When the training job finishes, the RayCluster grows back to 8 workers.
-
-Currently, Kueue evicts the whole RayCluster in step 2, because partial preemption does not shrink a PodSet with a topology assignment.
 
 ### Notes/Constraints/Caveats
 
